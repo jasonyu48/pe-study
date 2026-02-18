@@ -22,6 +22,7 @@ Output:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -148,6 +149,178 @@ def _summarize_ic(x: pd.Series) -> dict[str, float]:
     return {"mean_ic": mean, "std_ic": std, "ic_ir": ic_ir, "t_stat": t, "n": float(len(s))}
 
 
+def _summarize_performance(rets: pd.Series, *, periods_per_year: int = 12) -> dict[str, float]:
+    """
+    Simple performance summary for periodic returns.
+    Assumes rets is indexed by period timestamps (monthly in this project).
+    """
+    r = pd.to_numeric(rets, errors="coerce").fillna(0.0).astype("float64")
+    n = int(len(r))
+    if n == 0:
+        return {
+            "cagr": float("nan"),
+            "vol_ann": float("nan"),
+            "sharpe": float("nan"),
+            "max_drawdown": float("nan"),
+            "calmar": float("nan"),
+            "total_return": float("nan"),
+            "n_periods": 0.0,
+        }
+    eq = (1.0 + r).cumprod()
+    total = float(eq.iloc[-1] - 1.0)
+    years = float(n) / float(periods_per_year)
+    cagr = float(eq.iloc[-1] ** (1.0 / years) - 1.0) if years > 0 else float("nan")
+    vol_ann = float(r.std(ddof=1) * np.sqrt(periods_per_year)) if n > 1 else float("nan")
+    sharpe = float((r.mean() / r.std(ddof=1)) * np.sqrt(periods_per_year)) if n > 1 and r.std(ddof=1) != 0 else float("nan")
+    dd = (eq / eq.cummax() - 1.0).astype("float64")
+    max_dd = float(dd.min())
+    calmar = float(cagr / abs(max_dd)) if np.isfinite(cagr) and np.isfinite(max_dd) and max_dd < 0 else float("nan")
+    return {
+        "cagr": cagr,
+        "vol_ann": vol_ann,
+        "sharpe": sharpe,
+        "max_drawdown": max_dd,
+        "calmar": calmar,
+        "total_return": total,
+        "n_periods": float(n),
+    }
+
+
+def _build_equal_weight_top_quantile(score_row: pd.Series, *, top_quantile: float) -> pd.Series:
+    s = pd.to_numeric(score_row, errors="coerce").astype("float64")
+    s = s.replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return pd.Series(0.0, index=score_row.index, dtype="float64")
+    n = int(len(s))
+    k = max(1, int(np.floor(n * float(top_quantile))))
+    top = s.nlargest(k).index
+    w = pd.Series(0.0, index=score_row.index, dtype="float64")
+    w.loc[top] = 1.0 / float(k)
+    return w
+
+
+def _simulate_drift_rebalance(
+    *,
+    open_panel: pd.DataFrame,
+    score_panel: pd.DataFrame,
+    rebalance_every_m: int,
+    top_quantile: float,
+    cost_bps: float,
+    max_stale_months: int,
+) -> pd.DataFrame:
+    """
+    Drift-aware long-only backtest using month-start opens.
+
+    Execution model:
+      - signal/score observed at month-end t (score_panel index uses month-end timestamps)
+      - execute at next month open, which is represented by open_panel at month-end (t+1)
+      - returns are open-to-open (month start to next month start)
+      - rebalance every `rebalance_every_m` months (execute schedule), equal-weight top quantile
+      - anti-zombie rule: if a currently-held name is non-tradable for more than
+        `max_stale_months` consecutive months, force-drop it to cash.
+
+    Inputs:
+      - open_panel: index=month_end timestamps, values=open at month start of that month
+      - score_panel: index=month_end timestamps, cross-sectional score at that month end
+    """
+    idx = open_panel.index
+    cols = open_panel.columns
+    if not idx.equals(score_panel.index):
+        score_panel = score_panel.reindex(index=idx, columns=cols)
+    else:
+        score_panel = score_panel.reindex(columns=cols)
+
+    # monthly open-to-open returns aligned at current month (dt -> next dt)
+    r1m = (open_panel.shift(-1) / open_panel - 1.0).replace([np.inf, -np.inf], np.nan).astype("float64")
+
+    cost_rate = float(cost_bps) / 10000.0 if cost_bps and cost_bps > 0 else 0.0
+
+    # execution dates are every h months starting at idx[1] (first date with prior score)
+    exec_pos = list(range(1, len(idx), int(rebalance_every_m)))
+    exec_dates = set(pd.DatetimeIndex([idx[p] for p in exec_pos if p < len(idx)]))
+
+    w = pd.Series(0.0, index=cols, dtype="float64")  # weights AFTER trade at current open
+    stale_months = pd.Series(0, index=cols, dtype="int64")  # consecutive non-tradable months while held
+    equity = 1.0
+
+    out_rows = []
+    for t in range(0, len(idx) - 1):
+        dt = pd.Timestamp(idx[t])
+        tradable_now = open_panel.loc[dt].notna()
+
+        # drift to current open using previous month's realized return (t-1 -> t)
+        if t > 0:
+            r_prev = r1m.iloc[t - 1].copy()
+            # If return is unobservable for a name (e.g., suspended on month-start), assume 0% for that month.
+            r_prev = r_prev.fillna(0.0)
+            gross_prev = float((w * r_prev).sum())
+            value_after = 1.0 + gross_prev
+            if np.isfinite(value_after) and value_after > 0:
+                w = (w * (1.0 + r_prev)) / value_after
+            else:
+                w = pd.Series(0.0, index=cols, dtype="float64")
+
+        # Track stale non-tradable streak for currently held names.
+        held = w.abs() > 0.0
+        stale_months = stale_months.where(~held, other=0)
+        stale_months = stale_months.where(~(held & ~tradable_now), other=stale_months + 1)
+        stale_months = stale_months.where(~(held & tradable_now), other=0)
+
+        # Anti-zombie: if held and stale too long, force-drop to cash (no explicit trade cost).
+        force_drop = held & (stale_months > int(max_stale_months))
+        n_forced = int(force_drop.sum())
+        if n_forced > 0:
+            w = w.where(~force_drop, other=0.0)
+            stale_months = stale_months.where(~force_drop, other=0)
+
+        # rebalance at dt (current open) if scheduled
+        to = 0.0
+        cost = 0.0
+        if dt in exec_dates:
+            score_date = pd.Timestamp(idx[t - 1])  # previous month-end
+            srow = score_panel.loc[score_date].copy()
+            # tradable = has open at execution (if no open, assume cannot trade at that month-start)
+            tradable = tradable_now
+
+            # If a name is not tradable, carry existing position (cannot trade it).
+            w_fixed = w.where(~tradable, other=0.0)
+            fixed_sum = float(w_fixed.sum())
+
+            remaining = 1.0 - fixed_sum
+            if not np.isfinite(remaining) or remaining <= 0.0:
+                w_target = w.copy()
+            else:
+                # allocate remaining capital to top-quantile among tradable names
+                srow = srow.where(tradable)
+                w_tradable = _build_equal_weight_top_quantile(srow, top_quantile=top_quantile)
+                w_target = (w_fixed + w_tradable * remaining).astype("float64")
+
+            cash_before = 1.0 - float(w.sum())
+            cash_target = 1.0 - float(w_target.sum())
+            to = 0.5 * (float((w_target - w).abs().sum()) + abs(cash_target - cash_before))
+            cost = float(to * cost_rate)
+            w = w_target
+
+        # realize return over next month (dt -> dt_next)
+        r_cur = r1m.iloc[t].fillna(0.0)
+        gross = float((w * r_cur).sum())
+        net = gross - cost
+        equity = float(equity * (1.0 + net))
+
+        out_rows.append(
+            {
+                "date": dt,
+                "return": float(net),
+                "equity": float(equity),
+                "turnover": float(to),
+                "n_holdings": int((w.abs() > 0).sum()),
+                "n_forced_drops": n_forced,
+            }
+        )
+
+    return pd.DataFrame(out_rows)
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PE factor IC research.")
     p.add_argument("--pe", type=str, required=True, help="Month-end PE snapshots: date,symbol,pe")
@@ -165,6 +338,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--floor", type=float, default=-1e12, help="Floor score for ineligible names (threshold variant)")
     p.add_argument("--mom-lookback-m", type=int, default=6, help="Momentum lookback in months for threshold PE")
     p.add_argument("--horizons", type=str, default="1,6,12,24", help="Comma-separated forward horizons in months")
+    p.add_argument(
+        "--max-stale-months",
+        type=int,
+        default=3,
+        help="Force-drop held names to cash after this many consecutive non-tradable months (anti-zombie).",
+    )
     return p.parse_args(argv)
 
 
@@ -217,12 +396,20 @@ def main(argv: list[str] | None = None) -> int:
     results_summary = []
 
     for h in horizons:
-        # open-to-open using month-start opens
-        fwd = open_w.shift(-h) / open_w - 1.0
+        # Forward returns for IC MUST align with the execution model:
+        #   score observed at month-end t, execute at next month open (t+1 open),
+        #   so forward return horizon h starts at (t+1 open) and ends at (t+1+h open).
+        # open_w is indexed by month-end timestamps but contains the month-start open of that month.
+        # Therefore, for score date t:
+        #   start = open_w.shift(-1).loc[t]
+        #   end   = open_w.shift(-(h+1)).loc[t]
+        fwd = open_w.shift(-(h + 1)) / open_w.shift(-1) - 1.0
 
         # build scores per variant
         scores: dict[Variant, pd.DataFrame] = {}
-        scores["plain"] = (-pe_w).astype("float64")
+        # Plain PE: prefer lower PE, but treat invalid PE as the lowest score for comparability.
+        valid_pe = pe_w.notna() & (pe_w > 0) & np.isfinite(pe_w)
+        scores["plain"] = (-pe_w).where(valid_pe, other=floor).astype("float64")
 
         eligible = (mom > 0) & pe_w.notna() & (pe_w > 0) & np.isfinite(pe_w)
         scores["threshold"] = (-pe_w).where(eligible, other=floor).astype("float64")
@@ -232,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
             ind_scores.append(_industry_neutral_score(pe_w.loc[d], industry_map).rename(d))
         scores["industry_neutral"] = pd.DataFrame(ind_scores)
         scores["industry_neutral"].index = pe_w.index
-        scores["industry_neutral"] = scores["industry_neutral"].reindex(columns=pe_w.columns)
+        scores["industry_neutral"] = scores["industry_neutral"].reindex(columns=pe_w.columns).fillna(floor).astype("float64")
 
         for variant, sc in scores.items():
             ic = _compute_ic_series(sc, fwd, min_names=min_names)
@@ -240,6 +427,34 @@ def main(argv: list[str] | None = None) -> int:
             # attach to long series output
             tmp = pd.DataFrame({"date": ic.index, "horizon_m": h, "variant": variant, "ic": ic.values})
             results_series.append(tmp)
+
+            # Backtest for this (h, variant): long top 20%, rebalance every h months, drift-aware.
+            bt_curve = _simulate_drift_rebalance(
+                open_panel=open_w,
+                score_panel=sc,
+                rebalance_every_m=int(h),
+                top_quantile=0.2,
+                cost_bps=10.0,
+                max_stale_months=int(args.max_stale_months),
+            )
+            bt_dir = out_dir / "backtests" / f"h{int(h)}m" / str(variant)
+            _write_any(bt_curve, bt_dir / "equity_curve.parquet")
+            perf = _summarize_performance(pd.Series(bt_curve["return"].values, index=pd.to_datetime(bt_curve["date"])))
+            (bt_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "horizon_m": int(h),
+                        "variant": str(variant),
+                        "top_quantile": 0.2,
+                        "cost_bps": 10.0,
+                        "max_stale_months": int(args.max_stale_months),
+                        "periods_per_year": 12,
+                        **perf,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
             # summaries overall + by regimes
             summ_all = _summarize_ic(ic)

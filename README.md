@@ -8,10 +8,10 @@
 
 ### 目录结构（与 PE study 相关）
 
-- `data/`: TuShare 下载脚本（不提交大数据文件）
+- `data/`: TuShare 下载脚本
 - `src/pe_research.py`: 主研究脚本（生成 IC 汇总与时间序列）
 - `src/tushare_client.py`: TuShare token 读取与 client 初始化
-- `reports/pe_research_cn_all_open2open/README.md`: 一份示例结果解读（不提交 parquet 结果文件）
+- `reports/pe_research_cn_all_open2open/README.md`: 一份示例结果解读
 
 ### 环境安装
 
@@ -31,7 +31,7 @@ python data/tushare_selftest.py --token-path data/token
 
 ---
 
-## PE study 完整流程（open-to-open）
+## PE study 完整流程
 
 我们统一用一个口径：
 
@@ -85,6 +85,4 @@ python -m src.pe_research \
 输出：
 - `reports/pe_research_cn_all_open2open/ic_series.parquet`
 - `reports/pe_research_cn_all_open2open/ic_summary.parquet`
-
-> 注意：`reports/**/*.parquet` 已被 `.gitignore` 忽略，不会提交到 GitHub。
 
