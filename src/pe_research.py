@@ -69,8 +69,8 @@ def _prepare_monthly_panels(pe_long: pd.DataFrame, px_long: pd.DataFrame) -> tup
     px = px_long.copy()
     px["date"] = pd.to_datetime(px["date"])
     px["symbol"] = px["symbol"].astype(str).str.strip()
-    # accept close or adj_close
-    price_col = "close" if "close" in px.columns else ("adj_close" if "adj_close" in px.columns else None)
+    # accept close or adj_close; prefer adjusted close when present (qfq-equivalent)
+    price_col = "adj_close" if "adj_close" in px.columns else ("close" if "close" in px.columns else None)
     if price_col is None:
         raise SystemExit("prices file must contain column 'close' or 'adj_close'.")
     px["close"] = pd.to_numeric(px[price_col], errors="coerce")

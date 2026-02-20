@@ -10,11 +10,12 @@ Why:
     takes the first available open within that window (per-stock "month-start open").
 
 Output (long format):
-  columns: month, date, symbol, open
+  columns: month, date, symbol, open_raw, adj_factor, open
   where:
     - month is YYYY-MM
     - date is the first trading day (within the window) that the stock traded (datetime64[ns])
-    - open is that day's open price
+    - open_raw is that day's raw open price
+    - open is qfq-equivalent open (open_raw * adj_factor; normalized constant cancels in returns)
 
 Example:
   python data/fetch_cn_prices_monthstart_open_tushare.py --start 2016-01-01 --end 2025-12-31 --out data/cn_prices_monthstart_open.parquet
@@ -35,6 +36,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tushare_client import get_pro  # noqa: E402
+
+
+def _fetch_adj_factor_all(pro, trade_date: str) -> pd.DataFrame:
+    af = pro.adj_factor(trade_date=trade_date, fields="ts_code,trade_date,adj_factor")
+    if af is None or af.empty:
+        return pd.DataFrame(columns=["symbol", "adj_factor"])
+    af = af.rename(columns={"ts_code": "symbol"})
+    af["symbol"] = af["symbol"].astype(str).str.strip()
+    af["adj_factor"] = pd.to_numeric(af["adj_factor"], errors="coerce")
+    return af[["symbol", "adj_factor"]]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -92,18 +103,21 @@ def main(argv: list[str] | None = None) -> int:
             if df is None or df.empty:
                 time.sleep(float(args.sleep))
                 continue
+            af = _fetch_adj_factor_all(pro, td)
 
             df = df.rename(columns={"ts_code": "symbol"})
             df["date"] = pd.to_datetime(df["trade_date"])
             df["month"] = month
             df["symbol"] = df["symbol"].astype(str).str.strip()
-            df["open"] = pd.to_numeric(df["open"], errors="coerce")
+            df["open_raw"] = pd.to_numeric(df["open"], errors="coerce")
+            df = df.merge(af, on="symbol", how="left")
+            df["open"] = df["open_raw"] * df["adj_factor"]
 
             df = df.dropna(subset=["symbol", "date", "open"])
             if assigned:
                 df = df[~df["symbol"].isin(list(assigned))]
             if not df.empty:
-                month_rows.append(df[["month", "date", "symbol", "open"]])
+                month_rows.append(df[["month", "date", "symbol", "open_raw", "adj_factor", "open"]])
                 assigned.update(df["symbol"].astype(str).tolist())
 
             time.sleep(float(args.sleep))

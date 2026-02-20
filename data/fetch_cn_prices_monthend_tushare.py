@@ -7,7 +7,7 @@ Why:
   - Fetching by trade_date returns all stocks in one call (much faster than per-symbol)
 
 Output (long format):
-  columns: date, symbol, open, high, low, close, volume
+  columns: date, symbol, open, high, low, close, volume, adj_factor, adj_open, adj_high, adj_low, adj_close
   where date is the month-end trading day (datetime64[ns]) and symbol is ts_code
 
 Example:
@@ -29,6 +29,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tushare_client import get_pro  # noqa: E402
+
+
+def _fetch_adj_factor_all(pro, trade_date: str) -> pd.DataFrame:
+    af = pro.adj_factor(trade_date=trade_date, fields="ts_code,trade_date,adj_factor")
+    if af is None or af.empty:
+        return pd.DataFrame(columns=["symbol", "adj_factor"])
+    af = af.rename(columns={"ts_code": "symbol"})
+    af["symbol"] = af["symbol"].astype(str).str.strip()
+    af["adj_factor"] = pd.to_numeric(af["adj_factor"], errors="coerce")
+    return af[["symbol", "adj_factor"]]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -67,12 +77,18 @@ def main(argv: list[str] | None = None) -> int:
         df = pro.daily(trade_date=td, fields="ts_code,trade_date,open,high,low,close,vol")
         if df is None or df.empty:
             continue
+        af = _fetch_adj_factor_all(pro, td)
         df = df.rename(columns={"ts_code": "symbol", "vol": "volume"})
         df["date"] = pd.to_datetime(df["trade_date"])
         df["symbol"] = df["symbol"].astype(str).str.strip()
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        frames.append(df[["date", "symbol", "open", "high", "low", "close", "volume"]])
+        df = df.merge(af, on="symbol", how="left")
+        df["adj_open"] = df["open"] * df["adj_factor"]
+        df["adj_high"] = df["high"] * df["adj_factor"]
+        df["adj_low"] = df["low"] * df["adj_factor"]
+        df["adj_close"] = df["close"] * df["adj_factor"]
+        frames.append(df[["date", "symbol", "open", "high", "low", "close", "volume", "adj_factor", "adj_open", "adj_high", "adj_low", "adj_close"]])
         time.sleep(float(args.sleep))
 
     if not frames:
