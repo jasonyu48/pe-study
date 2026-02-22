@@ -34,3 +34,5 @@ reports/**/*.csv
 reports/**/*.png
 reports/**/*.json
 
+*_paths_*
+
